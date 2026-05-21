@@ -25,25 +25,144 @@ async function applyFilters(page, filters, searchRadius) {
     return true;
 }
 
+async function ensureAccordionOpen(page, triggerSelector, contentSelector, name) {
+    const trigger = page.locator(triggerSelector).first();
+    const content = page.locator(contentSelector).first();
+
+    await trigger.waitFor({ state: 'visible', timeout: 90000 });
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        const triggerExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
+        const contentState = await content.getAttribute('data-state').catch(() => null);
+
+        if (triggerExpanded === 'true' || contentState === 'open') {
+            console.log(`  ✅ ${name} accordion is open`);
+            return true;
+        }
+
+        await trigger.scrollIntoViewIfNeeded({ timeout: 10000 });
+        await trigger.click({ timeout: 10000, force: true });
+        await page.waitForTimeout(800);
+
+        const updatedExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
+        const updatedContentState = await content.getAttribute('data-state').catch(() => null);
+
+        if (updatedExpanded === 'true' || updatedContentState === 'open') {
+            console.log(`  ✅ Opened ${name} accordion`);
+            return true;
+        }
+    }
+
+    throw new Error(`${name} accordion did not open`);
+}
+
+async function findDistanceDropdown(page) {
+    const selectors = [
+        'select[data-testid="select-filter-distance"]',
+        'select[aria-label="Distance from me"]',
+        'select',
+    ];
+
+    for (const selector of selectors) {
+        const matches = page.locator(selector);
+        const count = await matches.count();
+
+        for (let i = 0; i < count; i++) {
+            const locator = matches.nth(i);
+
+            try {
+                await locator.waitFor({ state: 'visible', timeout: 3000 });
+
+                const optionInfo = await locator.evaluate((select) =>
+                    Array.from(select.options).map((option) => ({
+                        value: option.value,
+                        label: option.getAttribute('label'),
+                        ariaLabel: option.getAttribute('aria-label'),
+                        text: option.textContent.trim(),
+                    }))
+                );
+
+                const hasExpectedOption = optionInfo.some((option) =>
+                    option.value === '50000' ||
+                    option.label?.toLowerCase() === 'nationwide' ||
+                    option.ariaLabel?.toLowerCase() === 'nationwide' ||
+                    option.text?.toLowerCase() === 'nationwide'
+                );
+
+                if (!hasExpectedOption) continue;
+
+                console.log(`  ✅ Found distance dropdown using selector: ${selector}`);
+                console.log(`  🔎 Distance options: ${JSON.stringify(optionInfo)}`);
+                return locator;
+            } catch (_) {
+                // Try next visible match
+            }
+        }
+    }
+
+    return null;
+}
+
 async function setSearchRadius(page, searchRadius) {
     try {
         console.log(`🌍 Setting search radius to: ${searchRadius === 50000 ? 'Nationwide' : searchRadius + ' km'}`);
 
-        // Select the search distance dropdown (6-minute timeout)
-        const dropdown = await page.locator('select[data-testid="select-filter-distance"]');
-        await dropdown.waitFor({ state: 'visible', timeout: 90000 });
+        const dropdown = await findDistanceDropdown(page);
 
-        // Select the value (50000 for Nationwide, or specific km value)
-        await dropdown.selectOption(searchRadius.toString(), { timeout: 90000 });
+        if (!dropdown) {
+            throw new Error('Could not find distance dropdown using any known selector');
+        }
 
-        console.log(`  ✅ Search radius set successfully`);
+        const options = await dropdown.evaluate((select) =>
+            Array.from(select.options).map((option) => ({
+                value: option.value,
+                label: option.getAttribute('label'),
+                ariaLabel: option.getAttribute('aria-label'),
+                text: option.textContent.trim(),
+            }))
+        );
 
-        // Wait for results to update
+        let optionValue = searchRadius.toString();
+
+        if (searchRadius === 50000) {
+            const nationwideOption = options.find((option) =>
+                option.value === '50000' ||
+                option.label?.toLowerCase() === 'nationwide' ||
+                option.ariaLabel?.toLowerCase() === 'nationwide' ||
+                option.text?.toLowerCase() === 'nationwide'
+            );
+
+            if (!nationwideOption) {
+                throw new Error(`Nationwide option not found. Available options: ${JSON.stringify(options)}`);
+            }
+
+            optionValue = nationwideOption.value;
+            console.log(`  🌍 Nationwide option resolved to value: ${optionValue}`);
+        }
+
+        await dropdown.selectOption(optionValue, { timeout: 90000 });
         await page.waitForTimeout(2000);
+
+        const selectedValue = await dropdown.inputValue();
+
+        if (selectedValue !== optionValue) {
+            throw new Error(`Distance dropdown value mismatch. Expected ${optionValue}, got ${selectedValue}`);
+        }
+
+        console.log(`  ✅ Search radius set successfully: ${selectedValue}`);
         return true;
 
     } catch (error) {
         console.log(`  ❌ Search radius failed: ${error.message}`);
+
+        try {
+            await Actor.setValue(
+                `debug-distance-dropdown-${Date.now()}.png`,
+                await page.screenshot({ fullPage: true }),
+                { contentType: 'image/png' }
+            );
+        } catch (_) {}
+
         return false;
     }
 }
@@ -52,22 +171,43 @@ async function applyBodyTypeFilter(page, bodyTypes) {
     try {
         console.log(`🚗 Setting body types: ${bodyTypes.join(', ')}`);
 
-        // Open Body Style accordion (6-minute timeout)
-        await page.click('#BodyStyle-accordion-trigger', { timeout: 90000 });
-        await page.waitForTimeout(1000);
+        await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
-        // Click checkboxes for each body type
-        for (const bodyType of bodyTypes) {
-            if (bodyType.includes('Pickup')) {
-                // Find and click Pickup Truck checkbox (6-minute timeout)
-                await page.click('button[id*="PICKUP"], label:has-text("Pickup Truck")', { timeout: 90000 });
-                await page.waitForTimeout(500);
-                console.log('  ✅ Added Pickup Truck');
+        const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
+            const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+
+            await checkbox.waitFor({ state: 'attached', timeout: 90000 });
+            await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
+
+            const checkedBefore = await checkbox.getAttribute('aria-checked');
+            if (checkedBefore === 'true') {
+                console.log(`  ✅ ${groupName}: ${labelText} already selected`);
+                return true;
             }
-            // SUV/Crossover is already selected by default on the base URL
+
+            await checkbox.click({ timeout: 30000, force: true });
+            await page.waitForTimeout(700);
+
+            const checkedAfter = await checkbox.getAttribute('aria-checked');
+            if (checkedAfter !== 'true') {
+                throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
+            }
+
+            console.log(`  ✅ ${groupName}: Added ${labelText}`);
+            return true;
+        };
+
+        for (const bodyType of bodyTypes) {
+            if (bodyType.includes('SUV')) {
+                await clickCheckboxByAriaLabelContains('Body type', 'SUV / Crossover');
+            }
+
+            if (bodyType.includes('Pickup')) {
+                await clickCheckboxByAriaLabelContains('Body type', 'Pickup Truck');
+            }
         }
 
-        await page.waitForTimeout(2000); // Wait for results to update
+        await page.waitForTimeout(2000);
         return true;
     } catch (error) {
         console.log(`  ❌ Body type filter failed: ${error.message}`);
@@ -75,31 +215,112 @@ async function applyBodyTypeFilter(page, bodyTypes) {
     }
 }
 
+function normalizeMakeName(make) {
+    const map = {
+        ram: 'RAM',
+        gmc: 'GMC',
+        bmw: 'BMW',
+        fiat: 'FIAT',
+        mini: 'MINI',
+        infiniti: 'INFINITI',
+        'alfa romeo': 'Alfa_Romeo',
+        'land rover': 'Land_Rover',
+        'mercedes benz': 'Mercedes-Benz',
+        'mercedes-benz': 'Mercedes-Benz',
+    };
+
+    const key = make.trim().toLowerCase();
+    return map[key] || make.trim().replace(/\s+/g, '_');
+}
+
+async function clickMakeCheckbox(page, make) {
+    const normalizedMake = normalizeMakeName(make);
+
+    const selectors = [
+        `button[data-testid="checkbox-FILTER.MAKE_MODEL.${normalizedMake}"]`,
+        `button[data-cg-ft="checkbox-FILTER.MAKE_MODEL.${normalizedMake}"]`,
+        `button[id="FILTER.MAKE_MODEL.${normalizedMake}"]`,
+        `button[role="checkbox"][aria-label="${make}"]`,
+        `button[role="checkbox"][aria-label="${normalizedMake}"]`,
+        `label:has-text("${make}")`,
+        `label:has-text("${normalizedMake}")`,
+    ];
+
+    for (const selector of selectors) {
+        const locator = page.locator(selector).first();
+
+        try {
+            await locator.waitFor({ state: 'attached', timeout: 3000 });
+            await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
+            await page.waitForTimeout(300);
+
+            const checkbox = page.locator(`button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`).first();
+            const checkedBefore = await checkbox.getAttribute('aria-checked').catch(() => null);
+
+            if (checkedBefore === 'true') {
+                console.log(`  ✅ ${make} already selected`);
+                return true;
+            }
+
+            await locator.click({ timeout: 10000, force: true });
+            await page.waitForTimeout(700);
+
+            const checkedAfter = await checkbox.getAttribute('aria-checked').catch(() => null);
+
+            if (checkedAfter === 'true') {
+                console.log(`  ✅ Added ${make} using selector: ${selector}`);
+                return true;
+            }
+
+            console.log(`  ⚠️ Clicked ${make}, but checkbox state is still: ${checkedAfter}`);
+        } catch (_) {
+            // Try next selector
+        }
+    }
+
+    return false;
+}
+
 async function applyMakeFilter(page, makes) {
     try {
         console.log(`🏭 Setting makes: ${makes.join(', ')}`);
 
-        // Open Make & Model accordion
-        await page.click('#MakeAndModel-accordion-trigger', { timeout: 90000 });
-        await page.waitForTimeout(1000);
+        await ensureAccordionOpen(page, '#MakeAndModel-accordion-trigger', '#MakeAndModel-accordion-content', 'Make & Model');
 
-        // Click checkbox for each make (stable approach)
-        for (const make of makes) {
-            try {
-                // Handle special case: RAM needs to be uppercase to match button ID
-                const makeId = make.toUpperCase() === 'RAM' ? 'RAM' : make;
-
-                // Click the make button (escape dots in ID selector) with 6-minute timeout
-                await page.click(`#FILTER\\.MAKE_MODEL\\.${makeId}`, { timeout: 90000 });
-                console.log(`  ✅ Added ${make}`);
-                await page.waitForTimeout(500);
-            } catch (error) {
-                console.log(`  ❌ Could not click ${make}: ${error.message}`);
-                return false;
-            }
+        const showAllMakesButton = page.locator('button:has-text("Show all makes")').first();
+        if (await showAllMakesButton.isVisible().catch(() => false)) {
+            await showAllMakesButton.click({ timeout: 5000 });
+            await page.waitForTimeout(1000);
+            console.log('  ✅ Expanded make list');
         }
 
-        await page.waitForTimeout(2000); // Wait for results to update
+        await page.locator('#FILTER\\.MAKE_MODEL, ul[id="FILTER.MAKE_MODEL"]').first()
+            .waitFor({ state: 'visible', timeout: 90000 });
+
+        for (const make of makes) {
+            const success = await clickMakeCheckbox(page, make);
+
+            if (!success) {
+                console.log(`  ❌ Could not click ${make}`);
+
+                const availableMakes = await page.evaluate(() => {
+                    return Array.from(document.querySelectorAll('button[role="checkbox"][id^="FILTER.MAKE_MODEL."]'))
+                        .map((button) => ({
+                            id: button.id,
+                            ariaLabel: button.getAttribute('aria-label'),
+                            checked: button.getAttribute('aria-checked'),
+                            visibleText: button.closest('li')?.textContent?.trim(),
+                        }));
+                });
+
+                console.log(`  🔎 Available makes: ${JSON.stringify(availableMakes)}`);
+                return false;
+            }
+
+            await page.waitForTimeout(800);
+        }
+
+        await page.waitForTimeout(2500); // Wait for results to update
         return true;
     } catch (error) {
         console.log(`  ❌ Make filter failed: ${error.message}`);
@@ -111,9 +332,7 @@ async function applyPriceFilter(page) {
     try {
         console.log(`💰 Setting minimum price to: $35,000 CAD`);
 
-        // Open Price accordion (6-minute timeout)
-        await page.click('#Price-accordion-trigger', { timeout: 90000 });
-        await page.waitForTimeout(1000);
+        await ensureAccordionOpen(page, '#Price-accordion-trigger', '#Price-accordion-content', 'Price');
 
         // Find the MINIMUM slider specifically (not maximum)
         const minSlider = page.locator('[role="slider"][aria-label="Minimum"]');
@@ -148,9 +367,7 @@ async function applyDealRatingFilter(page, dealRatings) {
     try {
         console.log(`⭐ Setting deal ratings: ${dealRatings.join(', ')}`);
 
-        // Open Deal Rating accordion (6-minute timeout)
-        await page.click('#DealRating-accordion-trigger', { timeout: 90000 });
-        await page.waitForTimeout(1000);
+        await ensureAccordionOpen(page, '#DealRating-accordion-trigger', '#DealRating-accordion-content', 'Deal Rating');
 
         // Click checkboxes for each deal rating
         for (const rating of dealRatings) {
@@ -466,22 +683,47 @@ await Actor.main(async () => {
                     const preflight = window.__PREFLIGHT__ || {};
                     const listing = preflight.listing || {};
 
-                    const vinEl = document.querySelector('div[data-cg-ft="vin"] span._value_ujq1z_13');
-                    const makeEl = document.querySelector('div[data-cg-ft="make"] span._value_ujq1z_13');
-                    const modelEl = document.querySelector('div[data-cg-ft="model"] span._value_ujq1z_13');
-                    const trimEl = document.querySelector('div[data-cg-ft="trim"] span._value_ujq1z_13');
-                    const yearEl = document.querySelector('div[data-cg-ft="year"] span._value_ujq1z_13');
-                    const bodyTypeEl = document.querySelector('div[data-cg-ft="bodyType"] span._value_ujq1z_13');
-                    const fuelTypeEl = document.querySelector('div[data-cg-ft="fuelType"] span._value_ujq1z_13');
-                    const mileageEl = document.querySelector('div[data-cg-ft="mileage"] span._value_ujq1z_13');
+                    const getFieldText = (fieldName) => {
+                        const container = document.querySelector(`[data-cg-ft="${fieldName}"]`);
 
-                    let vin = vinEl ? vinEl.textContent.trim() : (listing.vin || null);
+                        if (container) {
+                            const spans = Array.from(container.querySelectorAll('span'))
+                                .map((span) => span.textContent.trim())
+                                .filter(Boolean);
+
+                            if (spans.length > 0) {
+                                return spans[spans.length - 1];
+                            }
+                        }
+
+                        const legacyValue = document.querySelector(`div[data-cg-ft="${fieldName}"] span[class*="_value_"]`);
+                        return legacyValue ? legacyValue.textContent.trim() : null;
+                    };
+
+                    const getPriceText = () => {
+                        const selectors = [
+                            'div[data-cg-ft="price"] h2',
+                            'div[data-cg-ft="price"] [data-testid]',
+                            'div[class*="_price_"] h2',
+                            'h2[class*="price"]',
+                        ];
+
+                        for (const selector of selectors) {
+                            const element = document.querySelector(selector);
+                            const text = element ? element.textContent.trim() : null;
+                            if (text) return text;
+                        }
+
+                        return null;
+                    };
+
+                    let vin = getFieldText('vin') || listing.vin || null;
                     if (!vin && listing.specs) {
                         const vinSpec = listing.specs.find(s => s.label && s.label.toLowerCase() === 'vin');
                         if (vinSpec) vin = vinSpec.value;
                     }
 
-                    let fuelType = fuelTypeEl ? fuelTypeEl.textContent.trim() : null;
+                    let fuelType = getFieldText('fuelType');
                     if (!fuelType && listing.specs) {
                         const fuelSpec = listing.specs.find(s =>
                             s.label && (s.label.toLowerCase().includes('fuel') || s.label.toLowerCase().includes('engine'))
@@ -492,8 +734,7 @@ await Actor.main(async () => {
                     const titleEl = document.querySelector('h1[data-cg-ft="vdp-listing-title"]');
                     const title = titleEl ? titleEl.textContent.trim() : '';
 
-                    const priceEl = document.querySelector('div._price_1yep1_1 h2');
-                    const priceText = priceEl ? priceEl.textContent.trim() : null;
+                    const priceText = getPriceText();
                     const priceValue = priceText ? parseInt(priceText.replace(/[$,]/g, '')) : null;
 
                     const dealerNameEl = document.querySelector('[data-testid="dealerName"]');
@@ -505,16 +746,16 @@ await Actor.main(async () => {
                         title: title || preflight.listingTitle,
                         price: priceValue || preflight.listingPriceValue || listing.price,
                         priceString: priceText || preflight.listingPriceString || listing.priceString,
-                        year: yearEl ? yearEl.textContent.trim() : (listing.year || preflight.listingYear),
-                        make: makeEl ? makeEl.textContent.trim() : (listing.make || preflight.listingMake),
-                        model: modelEl ? modelEl.textContent.trim() : (listing.model || preflight.listingModel),
-                        trim: trimEl ? trimEl.textContent.trim() : listing.trim,
-                        mileage: mileageEl ? mileageEl.textContent.trim() : (listing.mileage || listing.odometer),
+                        year: getFieldText('year') || listing.year || preflight.listingYear,
+                        make: getFieldText('make') || listing.make || preflight.listingMake,
+                        model: getFieldText('model') || listing.model || preflight.listingModel,
+                        trim: getFieldText('trim') || listing.trim,
+                        mileage: getFieldText('mileage') || listing.mileage || listing.odometer,
                         dealerName: dealerNameEl ? dealerNameEl.textContent.trim() : (listing.dealerName || preflight.listingSellerName),
                         dealerCity: locationFromTitle ? locationFromTitle.textContent.trim() : (listing.dealerCity || preflight.listingSellerCity),
                         dealerAddress: dealerAddressEl ? dealerAddressEl.textContent.trim() : null,
                         dealRating: listing.dealRating || listing.dealBadge,
-                        bodyType: bodyTypeEl ? bodyTypeEl.textContent.trim() : listing.bodyType,
+                        bodyType: getFieldText('bodyType') || listing.bodyType,
                         fuelType: fuelType,
                         url: window.location.href,
                         source: 'dom'
@@ -542,11 +783,15 @@ await Actor.main(async () => {
 
                 // Save car data
                 if (carData.vin || carData.title) {
+                    const sourceScraper = pageToScrape >= 1 && pageToScrape <= 6
+                        ? 'Newest 3-pager'
+                        : 'Newest';
+
                     const dataToSave = {
                         type: 'car_listing',
                         ...carData,
                         scrapedAt: new Date().toISOString(),
-                        source_scraper: 'Newest'
+                        source_scraper: sourceScraper
                     };
 
                     await Actor.pushData(dataToSave);
