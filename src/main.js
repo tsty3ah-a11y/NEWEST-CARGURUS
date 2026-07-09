@@ -9,11 +9,140 @@ chromium.use(StealthPlugin());
 // FILTER AUTOMATION HELPERS
 // ============================================
 
+// CarGurus shows a LIVE count next to every filter option ("SUV / Crossover (10,138)")
+// and recomputes them on every filter change, which remounts the checkbox/accordion
+// nodes. Any Playwright call that waits for element stability (scrollIntoViewIfNeeded,
+// or a held locator) dies with "Element is not attached to the DOM" or times out.
+// These helpers never hold a node across the re-render: they re-query fresh, click
+// natively in-page (no stability wait), and poll the state, tolerating transient nulls.
+
+async function readAttrInPage(page, selector, attr) {
+    return page.evaluate(({ selector, attr }) => {
+        const el = document.querySelector(selector);
+        return el ? el.getAttribute(attr) : null;
+    }, { selector, attr }).catch(() => null);
+}
+
+async function clickInPage(page, selector) {
+    return page.evaluate((selector) => {
+        const el = document.querySelector(selector);
+        if (!el) return false;
+        el.scrollIntoView({ block: 'center', inline: 'center' });
+        el.click();
+        return true;
+    }, selector).catch(() => false);
+}
+
+// Click a checkbox/toggle until `attr` reaches `want`, re-finding it fresh each pass so
+// a mid-click remount doesn't fail us. Reads state before clicking so we never toggle
+// an already-correct box back off. Returns true once the desired state is reached.
+async function clickUntilState(page, selector, { attr = 'aria-checked', want = 'true', label = selector, tries = 8 } = {}) {
+    for (let i = 1; i <= tries; i++) {
+        const current = await readAttrInPage(page, selector, attr);
+        if (current === want) return true;
+
+        const clicked = await clickInPage(page, selector);
+        if (!clicked) {
+            await page.waitForTimeout(700); // node not mounted yet — let it render, retry
+            continue;
+        }
+
+        await page.waitForTimeout(900); // let the live-count re-render settle
+        if (await readAttrInPage(page, selector, attr) === want) return true;
+    }
+
+    console.log(`  ⚠️ ${label}: state never reached ${attr}=${want} after ${tries} tries`);
+    return false;
+}
+
+async function withTimeout(promise, timeoutMs, label) {
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    });
+
+    try {
+        return await Promise.race([promise, timeout]);
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+async function closePageSafely(page, label = 'Page') {
+    if (!page || page.isClosed()) return true;
+    try {
+        await withTimeout(page.close({ runBeforeUnload: false }), 5000, `${label} close`);
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function closeBrowserSafely(browser, label = 'Browser') {
+    if (!browser) return true;
+    try {
+        await withTimeout(browser.close(), 10000, `${label} close`);
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+async function installBandwidthSaver(context) {
+    const blockedResourceTypes = new Set(['image', 'media', 'font']);
+    const blockedUrlParts = [
+        'googletagmanager.com',
+        'google-analytics.com',
+        'doubleclick.net',
+        'facebook.net',
+        'hotjar.com',
+        'segment.io',
+        'amplitude.com',
+        'clarity.ms',
+    ];
+
+    await context.route('**/*', async (route) => {
+        const request = route.request();
+        const resourceType = request.resourceType();
+        const url = request.url().toLowerCase();
+
+        const shouldBlock =
+            blockedResourceTypes.has(resourceType) ||
+            blockedUrlParts.some((part) => url.includes(part));
+
+        try {
+            if (shouldBlock) {
+                await route.abort('blockedbyclient');
+            } else {
+                await route.continue();
+            }
+        } catch (_) {
+            // The browser may close a request during navigation; ignore route races.
+        }
+    });
+
+    console.log('🪶 Bandwidth saver active: blocking images, media, fonts, and tracking calls');
+}
+
 async function applyFilters(page, filters, searchRadius) {
     console.log('🎯 Applying UI filters...');
 
     if (!await setSearchRadius(page, searchRadius)) return false;
-    if (!await applyBodyTypeFilter(page, filters.bodyTypes)) return false;
+    const bodyTypeApplied = await applyBodyTypeFilter(page, filters.bodyTypes);
+    if (!bodyTypeApplied) {
+        console.log('  ⚠️ Body type filter did not fully apply; continuing with remaining filters');
+    }
     if (filters.makes && filters.makes.length > 0) {
         if (!await applyMakeFilter(page, filters.makes)) return false;
     }
@@ -26,26 +155,23 @@ async function applyFilters(page, filters, searchRadius) {
 }
 
 async function ensureAccordionOpen(page, triggerSelector, contentSelector, name) {
-    const trigger = page.locator(triggerSelector).first();
-    const content = page.locator(contentSelector).first();
+    // Wait for the trigger to exist at all (fresh locator, don't hold it).
+    await page.locator(triggerSelector).first().waitFor({ state: 'attached', timeout: 30000 });
 
-    await trigger.waitFor({ state: 'visible', timeout: 90000 });
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-        const triggerExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
-        const contentState = await content.getAttribute('data-state').catch(() => null);
+    for (let attempt = 1; attempt <= 4; attempt++) {
+        const triggerExpanded = await readAttrInPage(page, triggerSelector, 'aria-expanded');
+        const contentState = await readAttrInPage(page, contentSelector, 'data-state');
 
         if (triggerExpanded === 'true' || contentState === 'open') {
             console.log(`  ✅ ${name} accordion is open`);
             return true;
         }
 
-        await trigger.scrollIntoViewIfNeeded({ timeout: 10000 });
-        await trigger.click({ timeout: 10000, force: true });
-        await page.waitForTimeout(800);
+        await clickInPage(page, triggerSelector); // native click, no stability wait
+        await page.waitForTimeout(900);
 
-        const updatedExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
-        const updatedContentState = await content.getAttribute('data-state').catch(() => null);
+        const updatedExpanded = await readAttrInPage(page, triggerSelector, 'aria-expanded');
+        const updatedContentState = await readAttrInPage(page, contentSelector, 'data-state');
 
         if (updatedExpanded === 'true' || updatedContentState === 'open') {
             console.log(`  ✅ Opened ${name} accordion`);
@@ -174,26 +300,18 @@ async function applyBodyTypeFilter(page, bodyTypes) {
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
         const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
-            const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+            // aria-label carries the live count ("SUV / Crossover (10,138)"), so match by
+            // substring. Click natively and poll — the node remounts on every count change.
+            const selector = `button[role="checkbox"][aria-label*="${labelText}"]`;
 
-            await checkbox.waitFor({ state: 'attached', timeout: 90000 });
-            await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
+            await page.locator(selector).first().waitFor({ state: 'attached', timeout: 30000 });
 
-            const checkedBefore = await checkbox.getAttribute('aria-checked');
-            if (checkedBefore === 'true') {
-                console.log(`  ✅ ${groupName}: ${labelText} already selected`);
-                return true;
+            const ok = await clickUntilState(page, selector, { want: 'true', label: `${groupName}: ${labelText}` });
+            if (!ok) {
+                throw new Error(`${groupName}: could not check ${labelText} (list kept re-rendering)`);
             }
 
-            await checkbox.click({ timeout: 30000, force: true });
-            await page.waitForTimeout(700);
-
-            const checkedAfter = await checkbox.getAttribute('aria-checked');
-            if (checkedAfter !== 'true') {
-                throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
-            }
-
-            console.log(`  ✅ ${groupName}: Added ${labelText}`);
+            console.log(`  ✅ ${groupName}: ${labelText} selected`);
             return true;
         };
 
@@ -236,46 +354,25 @@ function normalizeMakeName(make) {
 async function clickMakeCheckbox(page, make) {
     const normalizedMake = normalizeMakeName(make);
 
-    const selectors = [
-        `button[data-testid="checkbox-FILTER.MAKE_MODEL.${normalizedMake}"]`,
-        `button[data-cg-ft="checkbox-FILTER.MAKE_MODEL.${normalizedMake}"]`,
-        `button[id="FILTER.MAKE_MODEL.${normalizedMake}"]`,
-        `button[role="checkbox"][aria-label="${make}"]`,
-        `button[role="checkbox"][aria-label="${normalizedMake}"]`,
-        `label:has-text("${make}")`,
-        `label:has-text("${normalizedMake}")`,
-    ];
+    // The make button carries both id and data-testid on the same node (verified in the
+    // live DOM), e.g. id="FILTER.MAKE_MODEL.Ford". Use it as a single stable target and
+    // poll aria-checked — the make list remounts on every count change just like body type.
+    const selector = `button[id="FILTER.MAKE_MODEL.${normalizedMake}"]`;
 
-    for (const selector of selectors) {
-        const locator = page.locator(selector).first();
+    const present = await page.locator(selector).first()
+        .waitFor({ state: 'attached', timeout: 8000 })
+        .then(() => true)
+        .catch(() => false);
 
-        try {
-            await locator.waitFor({ state: 'attached', timeout: 3000 });
-            await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
-            await page.waitForTimeout(300);
+    if (!present) {
+        console.log(`  ⚠️ ${make}: checkbox not found (selector ${selector})`);
+        return false;
+    }
 
-            const checkbox = page.locator(`button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`).first();
-            const checkedBefore = await checkbox.getAttribute('aria-checked').catch(() => null);
-
-            if (checkedBefore === 'true') {
-                console.log(`  ✅ ${make} already selected`);
-                return true;
-            }
-
-            await locator.click({ timeout: 10000, force: true });
-            await page.waitForTimeout(700);
-
-            const checkedAfter = await checkbox.getAttribute('aria-checked').catch(() => null);
-
-            if (checkedAfter === 'true') {
-                console.log(`  ✅ Added ${make} using selector: ${selector}`);
-                return true;
-            }
-
-            console.log(`  ⚠️ Clicked ${make}, but checkbox state is still: ${checkedAfter}`);
-        } catch (_) {
-            // Try next selector
-        }
+    const ok = await clickUntilState(page, selector, { want: 'true', label: make });
+    if (ok) {
+        console.log(`  ✅ Added ${make}`);
+        return true;
     }
 
     return false;
@@ -335,11 +432,14 @@ async function applyPriceFilter(page) {
         await ensureAccordionOpen(page, '#Price-accordion-trigger', '#Price-accordion-content', 'Price');
 
         // Find the MINIMUM slider specifically (not maximum)
-        const minSlider = page.locator('[role="slider"][aria-label="Minimum"]');
-        await minSlider.waitFor({ state: 'visible', timeout: 90000 });
+        const sliderSel = '[role="slider"][aria-label="Minimum"]';
+        await page.locator(sliderSel).first().waitFor({ state: 'attached', timeout: 30000 });
 
-        // Click on the minimum slider to focus it
-        await minSlider.click({ timeout: 90000 });
+        // Focus the slider in-page (native — no stability wait) so keyboard input drives it
+        await page.evaluate((sel) => {
+            const el = document.querySelector(sel);
+            if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); el.click(); }
+        }, sliderSel);
         await page.waitForTimeout(500);
 
         // Set the slider value to 24 (which equals $35,000 CAD)
@@ -369,17 +469,27 @@ async function applyDealRatingFilter(page, dealRatings) {
 
         await ensureAccordionOpen(page, '#DealRating-accordion-trigger', '#DealRating-accordion-content', 'Deal Rating');
 
-        // Click checkboxes for each deal rating
+        // Click checkboxes for each deal rating — native click + poll, same remount issue.
         for (const rating of dealRatings) {
-            try {
-                // Click with 6-minute timeout
-                await page.click(`#FILTER\\.DEAL_RATING\\.${rating}`, { timeout: 90000 });
-                console.log(`  ✅ Added ${rating.replace('_', ' ')}`);
-                await page.waitForTimeout(300);
-            } catch (error) {
-                console.log(`  ❌ Could not click ${rating}: ${error.message}`);
+            const selector = `[id="FILTER.DEAL_RATING.${rating}"]`;
+
+            const present = await page.locator(selector).first()
+                .waitFor({ state: 'attached', timeout: 30000 })
+                .then(() => true)
+                .catch(() => false);
+
+            if (!present) {
+                console.log(`  ❌ Could not find ${rating} checkbox`);
                 return false;
             }
+
+            const ok = await clickUntilState(page, selector, { want: 'true', label: rating.replace('_', ' ') });
+            if (!ok) {
+                console.log(`  ❌ Could not check ${rating}`);
+                return false;
+            }
+
+            console.log(`  ✅ Added ${rating.replace('_', ' ')}`);
         }
 
         await page.waitForTimeout(2000); // Wait for results to update
@@ -437,6 +547,35 @@ await Actor.main(async () => {
     } = input;
 
     console.log('🚀 Starting CarGurus Stealth Scraper with UI Filters...');
+
+    // Wire the Apify proxy from the input into Playwright. WITHOUT this, the browser
+    // uses Apify's raw US datacenter IP — CarGurus then geolocates the /search route to
+    // US zip 20149 and returns an "Error / 0 results" page on cargurus.ca, which kills
+    // every filter. The Canadian RESIDENTIAL proxy makes the IP Canadian so location
+    // resolves correctly. (Passing proxyConfiguration in the input alone does nothing.)
+    let launchProxy;
+    const inputProxy = input.proxyConfiguration;
+    if (inputProxy && inputProxy.useApifyProxy !== false) {
+        const proxyConfiguration = await Actor.createProxyConfiguration({
+            groups: inputProxy.apifyProxyGroups,
+            countryCode: inputProxy.apifyProxyCountry,
+        });
+
+        if (proxyConfiguration) {
+            const proxyUrl = await proxyConfiguration.newUrl();
+            const parsed = new URL(proxyUrl);
+            launchProxy = {
+                server: `${parsed.protocol}//${parsed.host}`,
+                username: decodeURIComponent(parsed.username),
+                password: decodeURIComponent(parsed.password),
+            };
+            console.log(`🌐 Proxy active: ${parsed.host} | groups=${inputProxy.apifyProxyGroups?.join(',') || 'auto'} | country=${inputProxy.apifyProxyCountry || 'auto'}`);
+        }
+    }
+
+    if (!launchProxy) {
+        console.log('⚠️ No proxy in use — browser will use the datacenter IP (CarGurus may geolocate to the US and return 0 results).');
+    }
 
     // Open persistent Key-Value Store (survives between runs)
     const kv = await Actor.openKeyValueStore('scraper-state-newest');
@@ -498,13 +637,17 @@ await Actor.main(async () => {
     for (let filterAttempt = 1; filterAttempt <= 3; filterAttempt++) {
         // Fresh browser every attempt
         if (browser) {
-            await browser.close().catch(() => {});
+            const previousBrowserClosed = await closeBrowserSafely(browser, 'Previous browser');
+            if (!previousBrowserClosed) {
+                console.log('⚠️ Previous browser close timed out; continuing with a fresh launch');
+            }
         }
 
         console.log(`\n🔄 Starting fresh browser (attempt ${filterAttempt}/3)...`);
 
         browser = await chromium.launch({
             headless: true,
+            proxy: launchProxy, // Canadian residential proxy from input (undefined = direct)
             args: [
                 '--disable-blink-features=AutomationControlled',
                 '--disable-features=IsolateOrigins,site-per-process',
@@ -521,6 +664,8 @@ await Actor.main(async () => {
             geolocation: { longitude: -79.3832, latitude: 43.6532 },
             permissions: ['geolocation'],
         });
+
+        await installBandwidthSaver(context);
 
         page = await context.newPage();
 
@@ -555,7 +700,12 @@ await Actor.main(async () => {
     }
 
     if (!filtersSucceeded) {
-        if (browser) await browser.close().catch(() => {});
+        if (browser) {
+            const browserClosed = await closeBrowserSafely(browser);
+            if (!browserClosed) {
+                console.log('⚠️ Browser close timed out after filter failure; ending run anyway');
+            }
+        }
         console.log('🛑 Could not apply filters after 3 attempts. Will retry on next scheduled run.');
         return;
     }
@@ -679,7 +829,7 @@ await Actor.main(async () => {
                 await listingPage.waitForTimeout(2000);
 
                 // Extract data from the listing tab
-                const carData = await listingPage.evaluate(() => {
+                const carData = await withTimeout(listingPage.evaluate(() => {
                     const preflight = window.__PREFLIGHT__ || {};
                     const listing = preflight.listing || {};
 
@@ -760,12 +910,16 @@ await Actor.main(async () => {
                         url: window.location.href,
                         source: 'dom'
                     };
-                });
+                }), 25000, `Listing ${listingIndex + 1} data extraction`);
 
                 // Close the listing tab — back to search results automatically
-                await listingPage.close();
+                const listingTabClosed = await closePageSafely(listingPage, 'Listing tab');
                 listingPage = null;
-                console.log(`  ✅ Listing tab closed`);
+                if (listingTabClosed) {
+                    console.log(`  ✅ Listing tab closed`);
+                } else {
+                    console.log(`  ⚠️ Listing tab close timed out; continuing`);
+                }
 
                 // Add page metadata
                 carData.pageNumber = pageToScrape;
@@ -799,11 +953,11 @@ await Actor.main(async () => {
 
                     try {
                         const webhookUrl = 'https://n8nsaved-production.up.railway.app/webhook/cargurus';
-                        const response = await fetch(webhookUrl, {
+                        const response = await fetchWithTimeout(webhookUrl, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify(dataToSave)
-                        });
+                        }, 10000);
                         if (response.ok) {
                             console.log(`  📤 Sent to webhook (${response.status})`);
                         } else {
@@ -822,7 +976,10 @@ await Actor.main(async () => {
             } catch (error) {
                 console.error(`❌ Error processing listing ${listingIndex + 1}:`, error.message);
                 if (listingPage) {
-                    await listingPage.close().catch(() => {});
+                    const listingTabClosed = await closePageSafely(listingPage, 'Listing tab after error');
+                    if (!listingTabClosed) {
+                        console.log(`  ⚠️ Listing tab close timed out after error; continuing`);
+                    }
                     listingPage = null;
                 }
             }
@@ -850,6 +1007,9 @@ await Actor.main(async () => {
         console.error(`❌ Error processing pages ${pagesToScrape.join(', ')}:`, error.message);
     }
 
-    await browser.close();
+    const browserClosed = await closeBrowserSafely(browser);
+    if (!browserClosed) {
+        console.log('⚠️ Browser close timed out at end of run');
+    }
     console.log('\n✅ Scraping complete!');
 });
