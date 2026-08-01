@@ -167,6 +167,55 @@ async function setSearchRadius(page, searchRadius) {
     }
 }
 
+// ============================================================
+// DETACH-PROOF CHECKBOX FALLBACK (failure-mode #1)
+// ------------------------------------------------------------
+// CarGurus re-renders the filter panel (live result counts) while we interact
+// with it. That detaches the element mid-action, so the normal
+// scrollIntoViewIfNeeded()+click throws "element is not stable / not attached
+// to the DOM" and the whole filter attempt aborts. This fallback never holds a
+// handle across a re-render: it re-locates the checkbox fresh on every attempt,
+// scrolls via raw DOM (no stability wait), force-clicks, then re-reads the
+// state from a fresh locator. Only invoked AFTER the normal path has thrown, so
+// the happy path is left exactly as it was.
+// ============================================================
+async function clickCheckboxDetachProof(page, selector, name, maxAttempts = 6) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            const cb = page.locator(selector).first();
+            await cb.waitFor({ state: 'attached', timeout: 15000 });
+
+            const before = await cb.getAttribute('aria-checked').catch(() => null);
+            if (before === 'true') {
+                console.log(`  ✅ [detach-proof] ${name} already selected`);
+                return true;
+            }
+
+            // Raw-DOM scroll cannot throw "element is not stable"; then force-click.
+            await cb.evaluate((el) => el.scrollIntoView({ block: 'center' })).catch(() => {});
+            await cb.click({ timeout: 8000, force: true });
+            await page.waitForTimeout(600);
+
+            // Re-read from a FRESH locator — the clicked handle may be detached.
+            const after = await page.locator(selector).first()
+                .getAttribute('aria-checked').catch(() => null);
+            if (after === 'true') {
+                console.log(`  ✅ [detach-proof] ${name} selected (attempt ${attempt}/${maxAttempts})`);
+                return true;
+            }
+
+            console.log(`  ⚠️ [detach-proof] ${name} still ${after} after attempt ${attempt}/${maxAttempts} — retrying`);
+        } catch (err) {
+            console.log(`  ⚠️ [detach-proof] ${name} attempt ${attempt}/${maxAttempts} threw: ${err.message} — re-locating`);
+        }
+
+        await page.waitForTimeout(700);
+    }
+
+    console.log(`  ❌ [detach-proof] ${name} could not be selected after ${maxAttempts} attempts`);
+    return false;
+}
+
 async function applyBodyTypeFilter(page, bodyTypes) {
     try {
         console.log(`🚗 Setting body types: ${bodyTypes.join(', ')}`);
@@ -174,27 +223,40 @@ async function applyBodyTypeFilter(page, bodyTypes) {
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
         const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
-            const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+            const selector = `button[role="checkbox"][aria-label*="${labelText}"]`;
 
-            await checkbox.waitFor({ state: 'attached', timeout: 90000 });
-            await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
+            // ---- PRIMARY PATH (unchanged — this is what works on a good run) ----
+            try {
+                const checkbox = page.locator(selector).first();
 
-            const checkedBefore = await checkbox.getAttribute('aria-checked');
-            if (checkedBefore === 'true') {
-                console.log(`  ✅ ${groupName}: ${labelText} already selected`);
+                await checkbox.waitFor({ state: 'attached', timeout: 90000 });
+                await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
+
+                const checkedBefore = await checkbox.getAttribute('aria-checked');
+                if (checkedBefore === 'true') {
+                    console.log(`  ✅ ${groupName}: ${labelText} already selected`);
+                    return true;
+                }
+
+                await checkbox.click({ timeout: 30000, force: true });
+                await page.waitForTimeout(700);
+
+                const checkedAfter = await checkbox.getAttribute('aria-checked');
+                if (checkedAfter !== 'true') {
+                    throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
+                }
+
+                console.log(`  ✅ ${groupName}: Added ${labelText}`);
+                return true;
+            } catch (primaryError) {
+                // ---- FALLBACK: panel re-rendered and detached the element ----
+                console.log(`  ⚠️ ${groupName}: ${labelText} primary click failed (${primaryError.message}) — engaging detach-proof fallback`);
+                const ok = await clickCheckboxDetachProof(page, selector, `${groupName}: ${labelText}`);
+                if (!ok) {
+                    throw new Error(`${groupName}: ${labelText} could not be selected (primary + fallback both failed)`);
+                }
                 return true;
             }
-
-            await checkbox.click({ timeout: 30000, force: true });
-            await page.waitForTimeout(700);
-
-            const checkedAfter = await checkbox.getAttribute('aria-checked');
-            if (checkedAfter !== 'true') {
-                throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
-            }
-
-            console.log(`  ✅ ${groupName}: Added ${labelText}`);
-            return true;
         };
 
         for (const bodyType of bodyTypes) {
@@ -276,6 +338,16 @@ async function clickMakeCheckbox(page, make) {
         } catch (_) {
             // Try next selector
         }
+    }
+
+    // FALLBACK: every known selector failed — most likely the panel re-rendered
+    // and detached the element mid-action (same failure-mode #1 as body type).
+    // Only runs after the normal path is already exhausted, so it can't affect
+    // a good run.
+    console.log(`  ⚠️ ${make}: all selectors failed — engaging detach-proof fallback`);
+    const idSelector = `button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`;
+    if (await clickCheckboxDetachProof(page, idSelector, make)) {
+        return true;
     }
 
     return false;
