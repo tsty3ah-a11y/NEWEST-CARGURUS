@@ -487,6 +487,116 @@ async function applySortByNewest(page) {
     }
 }
 
+// ============================================================
+// VARIANT DIAGNOSTICS (read-only — never throws, never alters flow)
+// ------------------------------------------------------------
+// CarGurus serves a redesigned SRP to a share of sessions. On that variant the
+// results render fine but `a[data-testid="car-blade-link"]` and
+// `button[data-testid="srp-desktop-page-navigation-next-page"]` do not exist,
+// so the scraper sees an empty page. Screenshots proved the cars are there but
+// can't tell us what to select. This dumps the page's ACTUAL selectors so we
+// can target the new layout.
+//
+// Only called from paths that already failed, so it cannot affect a good run.
+// Every failure is swallowed — diagnostics must never break a scrape.
+// ============================================================
+async function captureVariantDiagnostics(page, label) {
+    try {
+        const diag = await page.evaluate(() => {
+            const out = {};
+
+            // What the scraper looks for today
+            out.scraperCardSelector = document.querySelectorAll('a[data-testid="car-blade-link"]').length;
+            out.scraperNextButton = !!document.querySelector('button[data-testid="srp-desktop-page-navigation-next-page"]');
+
+            // Page identity / block detection
+            out.url = location.href;
+            out.title = document.title;
+            out.bodyChars = document.body.innerText.length;
+            out.iframes = document.querySelectorAll('iframe').length;
+            out.looksBlocked = /captcha|access denied|unusual traffic|are you a robot/i
+                .test(document.body.innerText.slice(0, 4000));
+
+            // Where CarGurus thinks we are (failing runs resolved to zip=20149 / Ashburn VA)
+            const zipUrl = location.href.match(/[?&]zip=([^&]+)/);
+            out.zipInUrl = zipUrl ? zipUrl[1] : null;
+
+            // How many results the page claims to have
+            const rc = document.body.innerText.match(/([\d,]{2,})\s+(?:results|listings|cars|matches)/i);
+            out.resultCountText = rc ? rc[0] : null;
+
+            // EVERY data-testid on the page, by frequency — the new card/pager
+            // testids will stand out as high-count entries.
+            const ids = {};
+            document.querySelectorAll('[data-testid]').forEach((el) => {
+                const k = el.getAttribute('data-testid');
+                ids[k] = (ids[k] || 0) + 1;
+            });
+            out.testIds = Object.entries(ids).sort((a, b) => b[1] - a[1]).slice(0, 60);
+
+            // Anchors that point at a vehicle detail page = the cards, whatever they're called now
+            const vdpRe = /(inventorylisting|vdp\.action|\/Cars\/link\/|listingId=)/i;
+            const cards = Array.from(document.querySelectorAll('a[href]'))
+                .filter((a) => vdpRe.test(a.getAttribute('href') || ''));
+            out.vdpAnchorCount = cards.length;
+            out.vdpAnchorSample = cards.slice(0, 5).map((a) => ({
+                href: (a.getAttribute('href') || '').slice(0, 120),
+                testid: a.getAttribute('data-testid'),
+                cls: (a.className || '').toString().slice(0, 100),
+                dataAttrs: Array.from(a.attributes).map((x) => x.name).filter((n) => n.startsWith('data-')),
+                parentTestid: a.parentElement ? a.parentElement.getAttribute('data-testid') : null,
+                parentCls: a.parentElement ? (a.parentElement.className || '').toString().slice(0, 100) : null,
+            }));
+
+            // The first card's surrounding markup — shows us the wrapper to target
+            out.firstCardHtml = cards[0] && cards[0].closest('article,li,div')
+                ? cards[0].closest('article,li,div').outerHTML.slice(0, 1200)
+                : null;
+
+            // Anything that smells like pagination
+            const pagerRe = /next|pagination|page-nav|paging/i;
+            out.pagerCandidates = Array.from(document.querySelectorAll('button,a,nav,[role="navigation"]'))
+                .filter((el) => {
+                    const t = el.getAttribute('data-testid') || '';
+                    const al = el.getAttribute('aria-label') || '';
+                    const cl = (el.className || '').toString();
+                    return pagerRe.test(t) || pagerRe.test(al) || pagerRe.test(cl);
+                })
+                .slice(0, 15)
+                .map((el) => ({
+                    tag: el.tagName.toLowerCase(),
+                    testid: el.getAttribute('data-testid'),
+                    aria: el.getAttribute('aria-label'),
+                    cls: (el.className || '').toString().slice(0, 80),
+                    text: (el.innerText || '').trim().slice(0, 30),
+                    visible: el.getClientRects().length > 0,
+                }));
+
+            return out;
+        });
+
+        // Compact summary straight into the Apify run log (greppable, no KV needed)
+        console.log(`  🔬 [diag:${label}] cardSel=${diag.scraperCardSelector} nextBtn=${diag.scraperNextButton} vdpAnchors=${diag.vdpAnchorCount} iframes=${diag.iframes} blocked=${diag.looksBlocked} zip=${diag.zipInUrl} results="${diag.resultCountText}"`);
+        console.log(`  🔬 [diag:${label}] topTestIds=${JSON.stringify(diag.testIds.slice(0, 12))}`);
+        if (diag.vdpAnchorSample.length > 0) {
+            console.log(`  🔬 [diag:${label}] cardAnchor=${JSON.stringify(diag.vdpAnchorSample[0])}`);
+        }
+        if (diag.pagerCandidates.length > 0) {
+            console.log(`  🔬 [diag:${label}] pager=${JSON.stringify(diag.pagerCandidates.slice(0, 4))}`);
+        }
+
+        // Full dump + screenshot for offline analysis
+        await Actor.setValue(`diag-${label}.json`, diag);
+        await Actor.setValue(
+            `diag-${label}.png`,
+            await page.screenshot({ fullPage: false }),
+            { contentType: 'image/png' }
+        );
+    } catch (err) {
+        console.log(`  ⚠️ [diag:${label}] capture failed (ignored): ${err.message}`);
+    }
+}
+
 // ============================================
 // MAIN SCRAPER
 // ============================================
@@ -670,6 +780,13 @@ await Actor.main(async () => {
                         await page.waitForTimeout(4000);
                     } catch (error) {
                         console.log(`  ⚠️ Next button click failed: ${error.message}`);
+
+                        // DIAGNOSTIC ONLY — capture what this page actually looks like.
+                        // A missing Next button is our earliest signal that we were served
+                        // the redesigned SRP, and it fires before the hash fallback wrecks
+                        // the DOM state, so this is the cleanest sample we can take.
+                        await captureVariantDiagnostics(page, `nextbtn-fail-page${pageToScrape}`);
+
                         // Fallback to hash navigation if Next button fails
                         console.log(`  🔄 Falling back to hash navigation...`);
                         await page.evaluate((pageNum) => {
@@ -718,6 +835,11 @@ await Actor.main(async () => {
                 console.log(`📄 Page title: ${pageTitle}`);
 
                 await Actor.setValue(`debug-screenshot-page${pageToScrape}.png`, await page.screenshot({ fullPage: false }), { contentType: 'image/png' });
+
+                // DIAGNOSTIC ONLY — the screenshot proves cars are on the page but
+                // can't tell us what to select. This records the real selectors.
+                await captureVariantDiagnostics(page, `zero-listings-page${pageToScrape}`);
+
                 continue; // Skip to next page
             }
 
