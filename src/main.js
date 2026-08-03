@@ -488,6 +488,88 @@ async function applySortByNewest(page) {
 }
 
 // ============================================================
+// SRP LAYOUT COMPATIBILITY (fallback-first)
+// ------------------------------------------------------------
+// As of Aug 2026 CarGurus serves two different search-results layouts to
+// different sessions. Confirmed from live diagnostics — the redesigned page
+// renders results and pagination perfectly, it just renamed the testids:
+//
+//   CLASSIC     cards  a[data-testid="car-blade-link"]
+//               pager  button[data-testid="srp-desktop-page-navigation-next-page"]
+//
+//   REDESIGNED  cards  a[data-testid="tile-link"]   (inside srp-listing-tile)
+//               pager  button[data-testid="page-navigation-next-page"]
+//               also   page-navigation-last-page carries the true page count
+//
+// Everything below tries CLASSIC first and only falls through to REDESIGNED,
+// so runs that work today keep taking exactly the same path.
+// ============================================================
+
+const LISTING_SELECTORS = [
+    'a[data-testid="car-blade-link"]',   // classic — tried first, behaviour unchanged
+    'a[data-testid="tile-link"]',        // redesigned SRP
+];
+
+const NEXT_BUTTON_SELECTOR =
+    'button[data-testid="srp-desktop-page-navigation-next-page"], ' +
+    'button[data-testid="page-navigation-next-page"]';
+
+// Which card selector actually matches on this page? Returns the classic one
+// with count 0 when neither matches, so callers always get a usable string.
+async function resolveListingSelector(page) {
+    for (const selector of LISTING_SELECTORS) {
+        const count = await page
+            .evaluate((s) => document.querySelectorAll(s).length, selector)
+            .catch(() => 0);
+
+        if (count > 0) {
+            if (selector !== LISTING_SELECTORS[0]) {
+                console.log(`  ℹ️ Redesigned SRP detected — using ${selector}`);
+            }
+            return { selector, count };
+        }
+    }
+    return { selector: LISTING_SELECTORS[0], count: 0 };
+}
+
+// What page does the pager say we are on? null when it cannot be determined,
+// in which case callers fall back to the previous (assumed) behaviour.
+async function readCurrentPageFromDom(page) {
+    return await page.evaluate(() => {
+        const el = document.querySelector(
+            '[data-testid^="page-navigation-page-"][class*="_selected_"], ' +
+            '[data-testid^="srp-desktop-page-navigation-page-"][class*="_selected_"], ' +
+            '[data-testid^="page-navigation-page-"][aria-current="true"], ' +
+            '[data-testid^="srp-desktop-page-navigation-page-"][aria-current="true"]'
+        );
+        if (!el) return null;
+        const n = parseInt((el.textContent || '').replace(/[^\d]/g, ''), 10);
+        return Number.isFinite(n) && n > 0 ? n : null;
+    }).catch(() => null);
+}
+
+// Total pages available for the current filter set. null when unavailable.
+async function readTotalPagesFromDom(page) {
+    return await page.evaluate(() => {
+        const last = document.querySelector(
+            'button[data-testid="page-navigation-last-page"], ' +
+            'button[data-testid="srp-desktop-page-navigation-last-page"]'
+        );
+        if (last) {
+            const n = parseInt((last.textContent || '').replace(/[^\d]/g, ''), 10);
+            if (Number.isFinite(n) && n > 0) return n;
+        }
+        const nums = Array.from(document.querySelectorAll(
+            '[data-testid^="page-navigation-page-"], ' +
+            '[data-testid^="srp-desktop-page-navigation-page-"]'
+        ))
+            .map((el) => parseInt((el.textContent || '').replace(/[^\d]/g, ''), 10))
+            .filter((n) => Number.isFinite(n) && n > 0);
+        return nums.length ? Math.max(...nums) : null;
+    }).catch(() => null);
+}
+
+// ============================================================
 // VARIANT DIAGNOSTICS (read-only — never throws, never alters flow)
 // ------------------------------------------------------------
 // CarGurus serves a redesigned SRP to a share of sessions. On that variant the
@@ -653,7 +735,7 @@ await Actor.main(async () => {
     }
 
     // Calculate the 3-page batch
-    const pagesToScrape = [];
+    let pagesToScrape = [];
     for (let i = 0; i < 3; i++) {
         const pageNum = startPage + i;
         if (pageNum <= maxPages) {
@@ -749,6 +831,42 @@ await Actor.main(async () => {
 
         console.log(`✅ Filters applied! Generated URL with searchId`);
 
+        // Read back what the price slider ACTUALLY produced. The slider is driven by
+        // counting arrow-key presses, so if CarGurus rescales it we would silently
+        // filter at the wrong floor while still logging the intended number.
+        const appliedMinPrice = (filteredUrl.match(/[?&]minPrice=(\d+)/) || [])[1];
+        if (appliedMinPrice) {
+            const applied = Number(appliedMinPrice);
+            console.log(`💵 minPrice actually applied: $${applied.toLocaleString()}`);
+            if (applied !== 35000) {
+                console.log(`  ⚠️ PRICE DRIFT: intended $35,000 but the slider landed on $${applied.toLocaleString()} — the step scale has changed`);
+            }
+        } else {
+            console.log(`💵 ⚠️ No minPrice in the URL — the price filter may not have applied at all`);
+        }
+
+        // The pager exposes the true page count. Clamp DOWNWARD only: we never
+        // scrape beyond the configured maxPages, we just stop walking past the end
+        // of the real results. If the pager can't be read, behaviour is unchanged.
+        const detectedTotalPages = await readTotalPagesFromDom(page);
+        if (detectedTotalPages) {
+            console.log(`📊 Pager reports ${detectedTotalPages} total pages (configured maxPages: ${maxPages})`);
+            const dropped = pagesToScrape.filter((p) => p > detectedTotalPages);
+            if (dropped.length > 0) {
+                console.log(`  ⚠️ Dropping page(s) ${dropped.join(', ')} — past the last real page (${detectedTotalPages})`);
+                pagesToScrape = pagesToScrape.filter((p) => p <= detectedTotalPages);
+            }
+            if (pagesToScrape.length === 0) {
+                console.log(`✅ Reached the end of the results — resetting to page 1 for the next run`);
+                await kv.setValue('state', {
+                    nextPage: 1,
+                    lastScrapedDate: new Date().toISOString().split('T')[0],
+                    lastScraped: new Date().toISOString(),
+                    reason: 'past-last-page-reset',
+                });
+            }
+        }
+
         // Track current page (we start at page 1 after applying filters)
         let currentPageNumber = 1;
 
@@ -770,7 +888,11 @@ await Actor.main(async () => {
                         await page.waitForTimeout(800);
 
                         // Wait for and click the Next button (2-minute timeout)
-                        const nextButton = page.locator('button[data-testid="srp-desktop-page-navigation-next-page"]');
+                        // Matches the classic testid first, then the redesigned one.
+                        // On the redesigned layout this now resolves immediately instead
+                        // of stalling for the full 120s and falling through to the
+                        // (useless) hash fallback.
+                        const nextButton = page.locator(NEXT_BUTTON_SELECTOR).first();
                         await nextButton.waitFor({ state: 'visible', timeout: 120000 });
                         await nextButton.click({ timeout: 120000 });
 
@@ -793,6 +915,17 @@ await Actor.main(async () => {
                             window.location.hash = `resultsPage=${pageNum}`;
                         }, pageToScrape);
                         await page.waitForTimeout(5000);
+
+                        // Did it actually move? On the redesigned SRP the hash is ignored
+                        // outright — confirmed live: after "navigating" to page 22 the pager
+                        // still had page-1 selected and prev-page disabled. The real guard is
+                        // the pager check after this block; this is here so the log says why.
+                        const landedOn = await readCurrentPageFromDom(page);
+                        if (landedOn !== null && landedOn !== pageToScrape) {
+                            console.log(`  ❌ Hash navigation ignored — still on page ${landedOn}, wanted ${pageToScrape}`);
+                        } else if (landedOn !== null) {
+                            console.log(`  ✅ Hash navigation confirmed on page ${landedOn}`);
+                        }
                         break; // Exit the clicking loop since we used hash navigation
                     }
                 }
@@ -801,8 +934,17 @@ await Actor.main(async () => {
                 await page.evaluate(() => window.scrollTo(0, 0));
                 await page.waitForTimeout(1000);
 
-                // Update current page tracker
-                currentPageNumber = pageToScrape;
+                // Update current page tracker — but only if we actually arrived.
+                // This used to be assigned unconditionally, so after a failed fallback
+                // the scraper believed it was on page 22 while sitting on page 1, and
+                // scraped page 1 repeatedly while labelling the rows 19/20/21.
+                const confirmedPage = await readCurrentPageFromDom(page);
+                if (confirmedPage !== null && confirmedPage !== pageToScrape) {
+                    console.log(`  ⏭️ Expected page ${pageToScrape} but pager reports ${confirmedPage} — skipping so we don't save mislabelled rows`);
+                    currentPageNumber = confirmedPage;
+                    continue;
+                }
+                currentPageNumber = confirmedPage !== null ? confirmedPage : pageToScrape;
             }
 
             // Scroll to load car links
@@ -820,9 +962,10 @@ await Actor.main(async () => {
             await page.waitForTimeout(3000);
 
             // Count available car listings
-            const totalListings = await page.evaluate(() => {
-                return document.querySelectorAll('a[data-testid="car-blade-link"]').length;
-            });
+            // Resolve the card selector for whichever layout we were served, and
+            // reuse that same selector when reading hrefs below so the indexes can
+            // never drift between the count and the extraction.
+            const { selector: listingSelector, count: totalListings } = await resolveListingSelector(page);
 
             console.log(`🚗 Found ${totalListings} car listings on page ${pageToScrape}`);
 
@@ -840,6 +983,34 @@ await Actor.main(async () => {
                 // can't tell us what to select. This records the real selectors.
                 await captureVariantDiagnostics(page, `zero-listings-page${pageToScrape}`);
 
+                // Anti-wedge. A failed page deliberately does NOT advance nextPage, so
+                // the next run retries it. That is right for a transient failure but it
+                // used to mean a permanently broken page pinned the actor to the same
+                // spot all day. After 3 strikes we step over it.
+                try {
+                    const prevState = (await kv.getValue('state')) || {};
+                    const failures = { ...(prevState.failures || {}) };
+                    failures[pageToScrape] = (failures[pageToScrape] || 0) + 1;
+                    const todayStr = new Date().toISOString().split('T')[0];
+
+                    if (failures[pageToScrape] >= 3) {
+                        console.log(`  ⏭️ Page ${pageToScrape} has failed ${failures[pageToScrape]}x — advancing past it so the actor can't wedge`);
+                        delete failures[pageToScrape];
+                        await kv.setValue('state', {
+                            ...prevState,
+                            nextPage: pageToScrape + 1,
+                            lastScrapedDate: todayStr,
+                            lastScraped: new Date().toISOString(),
+                            failures,
+                        });
+                    } else {
+                        console.log(`  ↺ Page ${pageToScrape} failed (${failures[pageToScrape]}/3) — will retry next run`);
+                        await kv.setValue('state', { ...prevState, lastScrapedDate: todayStr, failures });
+                    }
+                } catch (stateErr) {
+                    console.log(`  ⚠️ Could not update failure state (ignored): ${stateErr.message}`);
+                }
+
                 continue; // Skip to next page
             }
 
@@ -853,10 +1024,10 @@ await Actor.main(async () => {
             let listingPage = null;
             try {
                 // Get listing URL from main search tab (which stays open the whole time)
-                const listingHref = await page.evaluate((index) => {
-                    const links = document.querySelectorAll('a[data-testid="car-blade-link"]');
+                const listingHref = await page.evaluate(({ index, sel }) => {
+                    const links = document.querySelectorAll(sel);
                     return links[index] ? links[index].href : null;
-                }, listingIndex);
+                }, { index: listingIndex, sel: listingSelector });
 
                 if (!listingHref) {
                     console.log(`  ⚠️ Listing ${listingIndex + 1} not found in DOM - skipping`);
@@ -1023,11 +1194,17 @@ await Actor.main(async () => {
         }
 
             // Save state after each page completes (more resilient to crashes)
+            // Page succeeded — clear any recorded failures for it.
+            const priorState = (await kv.getValue('state')) || {};
+            const clearedFailures = { ...(priorState.failures || {}) };
+            delete clearedFailures[pageToScrape];
+
             const nextPage = pageToScrape + 1;
             const today = new Date().toISOString().split('T')[0];
 
             await kv.setValue('state', {
                 nextPage,
+                failures: clearedFailures,
                 lastScrapedDate: today,
                 baseUrl: baseUrlWithFilters,
                 searchRadius,
