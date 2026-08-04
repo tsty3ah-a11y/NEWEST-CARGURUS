@@ -223,13 +223,67 @@ async function applyBodyTypeFilter(page, bodyTypes) {
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
         const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
-            const selector = `button[role="checkbox"][aria-label*="${labelText}"]`;
+            // Classic aria-label form stays FIRST, so a healthy run resolves on the
+            // first probe and behaves exactly as it always has. The rest cover the
+            // redesigned panel, where body types are keyed by group id
+            // (bodyTypeGroupIds=7,5 → 7 = SUV / Crossover, 5 = Pickup Truck) and the
+            // aria-label we key on today may not be present at all.
+            const groupId = labelText.includes('SUV') ? '7'
+                : labelText.includes('Pickup') ? '5'
+                : null;
+
+            const candidates = [
+                `button[role="checkbox"][aria-label*="${labelText}"]`,
+                ...(groupId ? [
+                    `[data-testid="checkbox-FILTER.BODY_TYPE_GROUP.${groupId}"]`,
+                    `button[role="checkbox"][id="FILTER.BODY_TYPE_GROUP.${groupId}"]`,
+                    `[data-testid*="BODY_TYPE_GROUP.${groupId}"]`,
+                ] : []),
+                `button[role="checkbox"][aria-label*="${labelText.split(' / ')[0]}"]`,
+            ];
+
+            // The classic selector keeps a generous budget so a slow-rendering panel
+            // still resolves exactly as it did before; the added fallbacks only need
+            // a short probe, since by then the panel has demonstrably rendered.
+            const probe = async (firstTimeout, restTimeout) => {
+                for (const [i, cand] of candidates.entries()) {
+                    const hit = await page.locator(cand).first()
+                        .waitFor({ state: 'attached', timeout: i === 0 ? firstTimeout : restTimeout })
+                        .then(() => true)
+                        .catch(() => false);
+                    if (hit) return cand;
+                }
+                return null;
+            };
+
+            let selector = await probe(30000, 5000);
+            if (!selector) {
+                // Nothing matched. Same lazily-mounted-accordion problem the Price
+                // drops filter hits — expand the panel and probe once more.
+                console.log(`  ⚠️ ${groupName}: ${labelText} not in the DOM — expanding filter sections and retrying`);
+                if (await expandFilterSections(page)) {
+                    selector = await probe(5000, 3000);
+                }
+            }
+
+            const resolved = selector !== null;
+            if (!resolved) {
+                // Record what the panel really looks like so the next occurrence
+                // gives us the selector instead of another guess.
+                await captureVariantDiagnostics(page, `bodytype-missing-${labelText.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`);
+                selector = candidates[0];
+            } else if (selector !== candidates[0]) {
+                console.log(`  ℹ️ ${groupName}: ${labelText} resolved via fallback selector: ${selector}`);
+            }
 
             // ---- PRIMARY PATH (unchanged — this is what works on a good run) ----
             try {
                 const checkbox = page.locator(selector).first();
 
-                await checkbox.waitFor({ state: 'attached', timeout: 90000 });
+                // Already proved attached above when resolved, so the long timeout
+                // costs nothing on a good run. When nothing matched, fail in 5s
+                // instead of burning 90s on a selector that cannot succeed.
+                await checkbox.waitFor({ state: 'attached', timeout: resolved ? 90000 : 5000 });
                 await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
 
                 const checkedBefore = await checkbox.getAttribute('aria-checked');
@@ -250,6 +304,12 @@ async function applyBodyTypeFilter(page, bodyTypes) {
                 return true;
             } catch (primaryError) {
                 // ---- FALLBACK: panel re-rendered and detached the element ----
+                // Only worth the 6 x 15s retry cycle if we know some selector does
+                // resolve — that is the transient detach this fallback exists for.
+                // If nothing ever matched, retrying cannot help, so fail fast.
+                if (!resolved) {
+                    throw new Error(`${groupName}: ${labelText} checkbox is not present in the panel (no known selector matched)`);
+                }
                 console.log(`  ⚠️ ${groupName}: ${labelText} primary click failed (${primaryError.message}) — engaging detach-proof fallback`);
                 const ok = await clickCheckboxDetachProof(page, selector, `${groupName}: ${labelText}`);
                 if (!ok) {
@@ -569,6 +629,108 @@ async function readTotalPagesFromDom(page) {
     }).catch(() => null);
 }
 
+// How many results does the SRP claim to have? Present on BOTH layouts, which
+// makes it the only page-count signal we can rely on when the pager markup
+// changes underneath us.
+async function readResultCountFromDom(page) {
+    return await page.evaluate(() => {
+        const m = document.body.innerText.match(/([\d,]{2,})\s+(?:results|listings|matches)/i);
+        if (!m) return null;
+        const n = parseInt(m[1].replace(/,/g, ''), 10);
+        return Number.isFinite(n) && n > 0 ? n : null;
+    }).catch(() => null);
+}
+
+// Are we sitting on the last page of the result set? A missing Next button only
+// means "the end" when a pager is actually on screen — otherwise we cannot tell
+// the end of results apart from a layout we do not recognise, and we return
+// false so the caller keeps its existing behaviour.
+async function isAtLastPage(page) {
+    return await page.evaluate(() => {
+        const next = document.querySelector(
+            'button[data-testid="srp-desktop-page-navigation-next-page"], ' +
+            'button[data-testid="page-navigation-next-page"]'
+        );
+        if (next
+            && !next.disabled
+            && next.getAttribute('aria-disabled') !== 'true'
+            && !/_disabled_/.test((next.className || '').toString())) {
+            return false;
+        }
+        const pagerPresent = !!document.querySelector(
+            '[data-testid*="page-navigation-prev-page"], ' +
+            '[data-testid*="page-navigation-first-page"], ' +
+            '[data-testid*="page-navigation-page-"]'
+        );
+        return pagerPresent;
+    }).catch(() => false);
+}
+
+// Identity of the listings currently rendered. Comparing this before and after a
+// navigation attempt is the only layout-independent way to prove we actually
+// moved — the pager cannot always be read, but the cards always can.
+async function readPageFingerprint(page) {
+    const { selector } = await resolveListingSelector(page);
+    return await page.evaluate((s) => {
+        const hrefs = Array.from(document.querySelectorAll(s))
+            .slice(0, 3)
+            .map((a) => a.getAttribute('href') || '');
+        return hrefs.length ? hrefs.join('|') : null;
+    }, selector).catch(() => null);
+}
+
+// Open every collapsed section in the filter panel. The redesigned SRP mounts
+// accordion contents lazily, so a collapsed section's controls are absent from
+// the DOM rather than merely hidden. Scoped to the panel so we can never click
+// page chrome; a no-op when the panel cannot be identified.
+async function expandFilterSections(page) {
+    const panelSelectors = ['[data-testid="desktop-filters-panel"]', '[data-testid="accordion-wrapper"]'];
+    let panel = null;
+    for (const sel of panelSelectors) {
+        const loc = page.locator(sel).first();
+        if (await loc.count().then((n) => n > 0).catch(() => false)) {
+            panel = loc;
+            break;
+        }
+    }
+    if (!panel) {
+        console.log('  ℹ️ No filter panel container found — skipping section expansion');
+        return false;
+    }
+
+    // Repeated passes: every click re-renders the list and invalidates the
+    // indices we are iterating over.
+    let opened = 0;
+    for (let pass = 1; pass <= 3; pass++) {
+        const triggers = panel.locator('button[aria-expanded="false"], [role="button"][aria-expanded="false"]');
+        const count = await triggers.count().catch(() => 0);
+        if (count === 0) break;
+
+        let clickedThisPass = 0;
+        for (let i = 0; i < count; i++) {
+            const trigger = triggers.nth(i);
+            try {
+                if (await trigger.getAttribute('aria-expanded') !== 'false') continue;
+                await trigger.scrollIntoViewIfNeeded({ timeout: 3000 });
+                await trigger.click({ timeout: 3000, force: true });
+                clickedThisPass++;
+                opened++;
+                await page.waitForTimeout(250);
+            } catch (_) {
+                // Detached mid-iteration — the next pass re-reads the list.
+            }
+        }
+        if (clickedThisPass === 0) break;
+    }
+
+    if (opened > 0) {
+        console.log(`  📂 Expanded ${opened} collapsed filter section(s)`);
+        await page.waitForTimeout(1000);
+        return true;
+    }
+    return false;
+}
+
 // ============================================================
 // VARIANT DIAGNOSTICS (read-only — never throws, never alters flow)
 // ------------------------------------------------------------
@@ -614,7 +776,35 @@ async function captureVariantDiagnostics(page, label) {
                 const k = el.getAttribute('data-testid');
                 ids[k] = (ids[k] || 0) + 1;
             });
-            out.testIds = Object.entries(ids).sort((a, b) => b[1] - a[1]).slice(0, 60);
+            // Cap raised from 60: sorting by frequency pushed every single-occurrence
+            // filter testid (checkbox-FILTER.*) past the cut, which is exactly the
+            // set we need to read the real selector back from.
+            out.testIds = Object.entries(ids).sort((a, b) => b[1] - a[1]).slice(0, 400);
+
+            // Every filter control in the panel, with enough attributes to build a
+            // selector from without guessing. Also records which sections are open,
+            // since the redesigned SRP does not mount a collapsed section's contents.
+            out.filterControls = Array.from(document.querySelectorAll(
+                '[role="checkbox"], input[type="checkbox"], [data-testid^="checkbox-"]'
+            )).slice(0, 200).map((el) => ({
+                tag: el.tagName.toLowerCase(),
+                testid: el.getAttribute('data-testid'),
+                id: el.getAttribute('id'),
+                aria: el.getAttribute('aria-label'),
+                checked: el.getAttribute('aria-checked'),
+                text: (el.closest('li,label,div')?.textContent || '').trim().slice(0, 40),
+            }));
+
+            out.filterSections = Array.from(document.querySelectorAll('[aria-expanded], [data-state]'))
+                .slice(0, 80)
+                .map((el) => ({
+                    tag: el.tagName.toLowerCase(),
+                    testid: el.getAttribute('data-testid'),
+                    id: el.getAttribute('id'),
+                    expanded: el.getAttribute('aria-expanded'),
+                    state: el.getAttribute('data-state'),
+                    text: (el.textContent || '').trim().slice(0, 40),
+                }));
 
             // Anchors that point at a vehicle detail page = the cards, whatever they're called now
             const vdpRe = /(inventorylisting|vdp\.action|\/Cars\/link\/|listingId=)/i;
@@ -660,6 +850,19 @@ async function captureVariantDiagnostics(page, label) {
         // Compact summary straight into the Apify run log (greppable, no KV needed)
         console.log(`  🔬 [diag:${label}] cardSel=${diag.scraperCardSelector} nextBtn=${diag.scraperNextButton} vdpAnchors=${diag.vdpAnchorCount} iframes=${diag.iframes} blocked=${diag.looksBlocked} zip=${diag.zipInUrl} results="${diag.resultCountText}"`);
         console.log(`  🔬 [diag:${label}] topTestIds=${JSON.stringify(diag.testIds.slice(0, 12))}`);
+        // Surface the filter controls we actually care about straight in the log,
+        // so the real selector is one grep away instead of a KV download.
+        const wantRe = /price[\s_-]?drop|pickup|truck|suv|crossover|body/i;
+        const hits = (diag.filterControls || []).filter((c) =>
+            wantRe.test(`${c.testid} ${c.id} ${c.aria} ${c.text}`));
+        if (hits.length > 0) {
+            console.log(`  🔬 [diag:${label}] filterControls=${JSON.stringify(hits.slice(0, 12))}`);
+        }
+        const sectionHits = (diag.filterSections || []).filter((s) =>
+            wantRe.test(`${s.testid} ${s.id} ${s.text}`));
+        if (sectionHits.length > 0) {
+            console.log(`  🔬 [diag:${label}] filterSections=${JSON.stringify(sectionHits.slice(0, 8))}`);
+        }
         if (diag.vdpAnchorSample.length > 0) {
             console.log(`  🔬 [diag:${label}] cardAnchor=${JSON.stringify(diag.vdpAnchorSample[0])}`);
         }
@@ -848,9 +1051,21 @@ await Actor.main(async () => {
         // The pager exposes the true page count. Clamp DOWNWARD only: we never
         // scrape beyond the configured maxPages, we just stop walking past the end
         // of the real results. If the pager can't be read, behaviour is unchanged.
-        const detectedTotalPages = await readTotalPagesFromDom(page);
+        // Prefer the pager. When it cannot be read — which is exactly what happens
+        // on the classic layout — derive the count from the "N results" text, which
+        // both layouts render. Still a downward-only clamp either way: we never
+        // scrape past the configured maxPages, we just stop walking off the end.
+        let detectedTotalPages = await readTotalPagesFromDom(page);
+        let pageCountSource = 'pager';
+        if (!detectedTotalPages) {
+            const resultCount = await readResultCountFromDom(page);
+            if (resultCount) {
+                detectedTotalPages = Math.ceil(resultCount / maxResults);
+                pageCountSource = `${resultCount} results / ${maxResults} per page`;
+            }
+        }
         if (detectedTotalPages) {
-            console.log(`📊 Pager reports ${detectedTotalPages} total pages (configured maxPages: ${maxPages})`);
+            console.log(`📊 ${detectedTotalPages} total pages available via ${pageCountSource} (configured maxPages: ${maxPages})`);
             const dropped = pagesToScrape.filter((p) => p > detectedTotalPages);
             if (dropped.length > 0) {
                 console.log(`  ⚠️ Dropping page(s) ${dropped.join(', ')} — past the last real page (${detectedTotalPages})`);
@@ -870,6 +1085,10 @@ await Actor.main(async () => {
         // Track current page (we start at page 1 after applying filters)
         let currentPageNumber = 1;
 
+        // Every VIN saved during this run. Last line of defence against writing
+        // the same car twice if pagination silently fails to advance.
+        const seenVins = new Set();
+
         // STEP 4-7: Loop through each page in the batch (3 pages)
         for (const pageToScrape of pagesToScrape) {
             console.log(`\n${'='.repeat(60)}`);
@@ -879,6 +1098,8 @@ await Actor.main(async () => {
             // Navigate to specific page if needed by clicking Next button (human-like)
             if (pageToScrape !== currentPageNumber) {
                 const clicksNeeded = pageToScrape - currentPageNumber;
+                let navigationFailed = false;
+                let atEndOfResults = false;
                 console.log(`🔄 Navigating from page ${currentPageNumber} to page ${pageToScrape} (${clicksNeeded} clicks)...`);
 
                 for (let i = 0; i < clicksNeeded; i++) {
@@ -909,12 +1130,31 @@ await Actor.main(async () => {
                         // the DOM state, so this is the cleanest sample we can take.
                         await captureVariantDiagnostics(page, `nextbtn-fail-page${pageToScrape}`);
 
+                        // Out of pages, or genuinely broken? A pager with no usable
+                        // Next button but a working prev/first button means we have
+                        // simply reached the last page of the result set. Walking
+                        // further would re-scrape this page under a wrong number.
+                        atEndOfResults = await isAtLastPage(page);
+
+                        // Fingerprint the listings before we try to move, so we can
+                        // prove afterwards whether anything actually changed.
+                        const beforeNav = await readPageFingerprint(page);
+
                         // Fallback to hash navigation if Next button fails
                         console.log(`  🔄 Falling back to hash navigation...`);
                         await page.evaluate((pageNum) => {
                             window.location.hash = `resultsPage=${pageNum}`;
                         }, pageToScrape);
                         await page.waitForTimeout(5000);
+
+                        // Same cards as before the jump = the hash was ignored. This
+                        // is the check that stops the same listings being saved three
+                        // times under three different page numbers.
+                        const afterNav = await readPageFingerprint(page);
+                        if (beforeNav && afterNav && beforeNav === afterNav) {
+                            console.log(`  ❌ Hash navigation did not move the page — identical listings before and after`);
+                            navigationFailed = true;
+                        }
 
                         // Did it actually move? On the redesigned SRP the hash is ignored
                         // outright — confirmed live: after "navigating" to page 22 the pager
@@ -945,6 +1185,28 @@ await Actor.main(async () => {
                     continue;
                 }
                 currentPageNumber = confirmedPage !== null ? confirmedPage : pageToScrape;
+
+                // Past the last real page. Stop the batch and rewind to page 1 so
+                // tomorrow's runs start from the top instead of grinding against
+                // the tail forever.
+                if (atEndOfResults) {
+                    console.log(`✅ Page ${pageToScrape} is past the last page of results — stopping here and resetting to page 1`);
+                    await kv.setValue('state', {
+                        nextPage: 1,
+                        lastScrapedDate: new Date().toISOString().split('T')[0],
+                        lastScraped: new Date().toISOString(),
+                        reason: 'reached-end-of-results',
+                    });
+                    break;
+                }
+
+                // We could not get to the page we were asked for. Skipping is the
+                // whole point: scraping now would save this page's rows labelled
+                // with a page number they do not belong to.
+                if (navigationFailed) {
+                    console.log(`  ⏭️ Could not reach page ${pageToScrape} — skipping so no mislabelled rows are saved`);
+                    continue;
+                }
             }
 
             // Scroll to load car links
@@ -1158,6 +1420,13 @@ await Actor.main(async () => {
                         scrapedAt: new Date().toISOString(),
                         source_scraper: sourceScraper
                     };
+
+                    if (dataToSave.vin && seenVins.has(dataToSave.vin)) {
+                        console.log(`  ⏭️ Duplicate VIN ${dataToSave.vin} already saved this run — skipping`);
+                        await page.waitForTimeout(1000 + Math.random() * 2000);
+                        continue;
+                    }
+                    if (dataToSave.vin) seenVins.add(dataToSave.vin);
 
                     await Actor.pushData(dataToSave);
                     console.log(`  ✅ Saved to dataset`);
